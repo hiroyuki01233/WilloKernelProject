@@ -1,0 +1,62 @@
+;
+; WilloKernel.inf
+;
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System ; TODO: specify appropriate Class
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318} ; TODO: specify appropriate ClassGuid
+Provider    = %ManufacturerName%
+CatalogFile = WilloKernel.cat
+DriverVer=03/13/2025,1.10.2136.1
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+WilloKernel.sys  = 1,,
+
+;*****************************************
+; Install Section
+;*****************************************
+
+[Manufacturer]
+%ManufacturerName% = Standard,NT$ARCH$.10.0...16299 ; %13% support introduced in build 16299
+
+[Standard.NT$ARCH$.10.0...16299]
+%WilloKernel.DeviceDesc% = WilloKernel_Device, Root\WilloKernel ; TODO: edit hw-id
+
+[WilloKernel_Device.NT]
+CopyFiles = File_Copy
+
+[File_Copy]
+WilloKernel.sys
+
+;-------------- Service installation
+[WilloKernel_Device.NT.Services]
+AddService = WilloKernel,%SPSVCINST_ASSOCSERVICE%, WilloKernel_Service_Inst
+
+; -------------- WilloKernel driver install sections
+[WilloKernel_Service_Inst]
+DisplayName    = %WilloKernel.SVCDESC%
+ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
+StartType      = 3               ; SERVICE_DEMAND_START
+ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %13%\WilloKernel.sys
+
+[WilloKernel_Device.NT.Wdf]
+KmdfService = WilloKernel, WilloKernel_wdfsect
+
+[WilloKernel_wdfsect]
+KmdfLibraryVersion = $KMDFVERSION$
+
+[Strings]
+SPSVCINST_ASSOCSERVICE = 0x00000002
+ManufacturerName = "<Your manufacturer name>" ;TODO: Replace with your manufacturer name
+DiskName = "WilloKernel Installation Disk"
+WilloKernel.DeviceDesc = "WilloKernel Device"
+WilloKernel.SVCDESC = "WilloKernel Service"

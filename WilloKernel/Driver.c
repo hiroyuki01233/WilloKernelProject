@@ -29,9 +29,14 @@ NTSTATUS ReloadAllFiles();
 UCHAR ConvertAsciiToScancode(char ch);
 BOOLEAN RequiresShift(char ch);
 
+VOID ReloadAllFilesWorker(PVOID Context);
 
 PDEVICE_OBJECT g_FilterDeviceObject = NULL;
 PDEVICE_OBJECT g_LowerKeyboardDeviceObject = NULL;
+
+typedef struct _RELOAD_WORK_ITEM {
+    WORK_QUEUE_ITEM WorkItem;
+} RELOAD_WORK_ITEM, * PRELOAD_WORK_ITEM;
 
 NTSTATUS
 DriverEntry(
@@ -169,12 +174,22 @@ NTSTATUS KeyboardFilterPassThrough(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     return IoCallDriver(g_LowerKeyboardDeviceObject, Irp);
 }
 
+VOID ReloadAllFilesWorker(PVOID Context)
+{
+    UNREFERENCED_PARAMETER(Context);
+    // Call the heavy file reload operation.
+    ReloadAllFiles();
+
+    // Free the memory allocated for the work item.
+    ExFreePoolWithTag(Context, 'wldR');
+}
+
 NTSTATUS KeyboardFilterReadComplete(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID Context)
 {
     UNREFERENCED_PARAMETER(DeviceObject);
     UNREFERENCED_PARAMETER(Context);
 
-    // 下位ドライバの処理が成功し、SystemBufferにデータがあるかを確認
+    // Check if the lower driver succeeded and SystemBuffer contains data.
     if (NT_SUCCESS(Irp->IoStatus.Status) && Irp->AssociatedIrp.SystemBuffer != NULL)
     {
         ULONG readBytes = (ULONG)Irp->IoStatus.Information;
@@ -186,11 +201,24 @@ NTSTATUS KeyboardFilterReadComplete(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID
             DbgPrint("Willo: Key event (Complete): MakeCode = 0x%x, Flags = 0x%x\n",
                 keyboardData[i].MakeCode, keyboardData[i].Flags);
 
-            if (keyboardData[i].MakeCode == 0x43) {
-                ReloadAllFiles();
+            // When F9 is pressed, offload the reload work.
+            if (keyboardData[i].MakeCode == 0x43)
+            {
+                PRELOAD_WORK_ITEM reloadWorkItem = (PRELOAD_WORK_ITEM)
+                ExAllocatePoolWithTag(NonPagedPool, sizeof(RELOAD_WORK_ITEM), 'wldR');
+                if (reloadWorkItem)
+                {
+                    ExInitializeWorkItem(&reloadWorkItem->WorkItem, ReloadAllFilesWorker, reloadWorkItem);
+                    ExQueueWorkItem(&reloadWorkItem->WorkItem, CriticalWorkQueue);
+                    DbgPrint("Willo: Queued work item to reload files\n");
+                }
+                else
+                {
+                    DbgPrint("Willo: Failed to allocate work item for reloading files\n");
+                }
             }
 
-            // F1～F8キーの範囲の場合
+            // F1～F8 key handling remains the same.
             if (keyboardData[i].MakeCode >= 0x3B && keyboardData[i].MakeCode <= 0x42)
             {
                 int fileIndex = keyboardData[i].MakeCode - 0x3B; // F1ならindex 0、F2ならindex 1、...
@@ -198,7 +226,7 @@ NTSTATUS KeyboardFilterReadComplete(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID
                 {
                     PCHAR fileContent = g_FileBuffers[fileIndex].Buffer;
                     ULONG fileLength = (ULONG)strlen(fileContent);
-                    // 各文字について、シフトが必要な場合は4イベント、通常は2イベントとして計算
+                    // Each character may result in 4 events if shift is required, 2 otherwise.
                     ULONG worstCaseInjectionEvents = fileLength * 4;
                     ULONG newCount = count - 1 + worstCaseInjectionEvents;
                     ULONG newSize = newCount * sizeof(KEYBOARD_INPUT_DATA);
@@ -210,7 +238,7 @@ NTSTATUS KeyboardFilterReadComplete(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID
                         return STATUS_INSUFFICIENT_RESOURCES;
                     }
 
-                    // Fキーイベント以前のイベントをコピー
+                    // Copy events before the F-key event.
                     if (i > 0)
                     {
                         RtlCopyMemory(newBuffer, keyboardData, i * sizeof(KEYBOARD_INPUT_DATA));
@@ -218,10 +246,9 @@ NTSTATUS KeyboardFilterReadComplete(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID
 
                     DbgPrint("Willo: Injecting keystrokes from F%d.txt\n", fileIndex + 1);
 
-                    // 基本となるフラグ。ここではMakeイベント用にKEY_BREAKをクリアしたものを使用
                     ULONG baseFlags = keyboardData[i].Flags & ~KEY_BREAK;
+                    ULONG index = i;  // New buffer insertion start
 
-                    ULONG index = i;  // 新しいバッファでの挿入開始位置
                     for (ULONG j = 0; j < fileLength; j++)
                     {
                         char ch = fileContent[j];
@@ -235,51 +262,43 @@ NTSTATUS KeyboardFilterReadComplete(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID
 
                         if (RequiresShift(ch))
                         {
-                            // シフトを必要とする文字の場合は、シフトと文字のMake/Breakイベントを注入する
-
-                            // 1. シフトキー押下 (Make)
+                            // Inject shift + key events.
                             newBuffer[index].MakeCode = SHIFT_MAKE;
-                            newBuffer[index].Flags = baseFlags;  // Makeイベント
+                            newBuffer[index].Flags = baseFlags;  // Make event
                             DbgPrint("Willo: Injected Shift Make for %c\n", ch);
                             index++;
 
-                            // 2. 文字キー押下 (Make)
                             newBuffer[index].MakeCode = scancode;
-                            newBuffer[index].Flags = baseFlags;  // Makeイベント
+                            newBuffer[index].Flags = baseFlags;  // Make event
                             DbgPrint("Willo: Injected Make for %c, scancode=0x%x\n", ch, scancode);
                             index++;
 
-                            // 3. 文字キー離上 (Break)
                             newBuffer[index].MakeCode = scancode;
-                            newBuffer[index].Flags = baseFlags | KEY_BREAK;  // Breakイベント
+                            newBuffer[index].Flags = baseFlags | KEY_BREAK;  // Break event
                             DbgPrint("Willo: Injected Break for %c, scancode=0x%x\n", ch, scancode);
                             index++;
 
-                            // 4. シフトキー離上 (Break)
                             newBuffer[index].MakeCode = SHIFT_MAKE;
-                            newBuffer[index].Flags = baseFlags | KEY_BREAK;  // Breakイベント
+                            newBuffer[index].Flags = baseFlags | KEY_BREAK;  // Break event
                             DbgPrint("Willo: Injected Shift Break for %c\n", ch);
                             index++;
                         }
                         else
                         {
-                            // 通常の文字の場合は、Make/Breakペアを注入する
-
-                            // 1. 文字キー押下 (Make)
+                            // Inject key press/release events.
                             newBuffer[index].MakeCode = scancode;
-                            newBuffer[index].Flags = baseFlags;  // Makeイベント
+                            newBuffer[index].Flags = baseFlags;  // Make event
                             DbgPrint("Willo: Injected Make for %c, scancode=0x%x\n", ch, scancode);
                             index++;
 
-                            // 2. 文字キー離上 (Break)
                             newBuffer[index].MakeCode = scancode;
-                            newBuffer[index].Flags = baseFlags | KEY_BREAK;  // Breakイベント
+                            newBuffer[index].Flags = baseFlags | KEY_BREAK;  // Break event
                             DbgPrint("Willo: Injected Break for %c, scancode=0x%x\n", ch, scancode);
                             index++;
                         }
                     }
 
-                    // Fキーイベント以降のイベントをコピー
+                    // Copy events after the F-key event.
                     if (i + 1 < count)
                     {
                         RtlCopyMemory(&newBuffer[index],
@@ -287,17 +306,16 @@ NTSTATUS KeyboardFilterReadComplete(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID
                             (count - i - 1) * sizeof(KEYBOARD_INPUT_DATA));
                     }
 
-                    // 挿入後の新たなイベント数を再計算
                     ULONG injectedEvents = index - i;
                     newCount = i + injectedEvents + (count - i - 1);
                     newSize = newCount * sizeof(KEYBOARD_INPUT_DATA);
                     DbgPrint("Willo: Completed key injection for F%d, newCount=%lu\n", fileIndex + 1, newCount);
 
-                    // IRP の更新
+                    // Update the IRP.
                     Irp->IoStatus.Information = newSize;
                     Irp->AssociatedIrp.SystemBuffer = newBuffer;
 
-                    break; // 複数のFキーに対しては1回のみ処理
+                    break; // Only process one F-key event.
                 }
             }
         }
@@ -308,9 +326,9 @@ NTSTATUS KeyboardFilterReadComplete(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID
         IoMarkIrpPending(Irp);
     }
     Irp->IoStatus.Status = STATUS_SUCCESS;
-
     return STATUS_CONTINUE_COMPLETION;
 }
+
 
 NTSTATUS ReloadAllFiles()
 {
